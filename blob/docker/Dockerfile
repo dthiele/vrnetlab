@@ -4,7 +4,7 @@ RUN apt-get update -qy && \
    apt-get install -y --no-install-recommends qemu-utils && \
    rm -rf /var/lib/apt/lists/*
 
-ARG IMAGE
+#ARG IMAGE
 COPY images /images
 
 FROM public.ecr.aws/docker/library/debian:bookworm-slim

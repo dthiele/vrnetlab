@@ -1,9 +1,8 @@
 VENDOR=Elektrobit
 NAME=Blob
-IMAGE_FORMAT=ext4
-IMAGE_GLOB=*.ext4
-
-VERSION=$(shell echo $(IMAGE) | sed -e 's/.*-\([-0-9a-zA-A]\{1,\}\)\.rootfs.*/\1/')
+IMAGE_FORMAT=tgz
+IMAGE_GLOB=*.tgz
+VERSION=$(shell echo $(IMAGE) | sed -e 's/.*-\([-0-9a-zA-A]\{1,\}\)\.tgz/\1/')
 
 
 -include ../makefile-sanity.include
@@ -11,4 +10,4 @@ VERSION=$(shell echo $(IMAGE) | sed -e 's/.*-\([-0-9a-zA-A]\{1,\}\)\.rootfs.*/\1
 -include ../makefile-install.include
 
 docker-build-image-copy:
-	/bin/bash download.sh
+	./extract.sh $(IMAGE)
