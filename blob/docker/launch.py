@@ -225,7 +225,7 @@ class Blob_vm(vrnetlab.VM):
             "-kernel",
             self.kernel,
             "-append",
-            f"'root=/dev/vda rw mem={self.ram}M ip=192.168.7.2::192.168.7.1:255.255.255.0::eth0:off:8.8.8.8 console=ttyAMA0 net.ifnames=0'",
+            f"'root=/dev/vda rw mem={self.ram}M ip=10.0.0.15::10.0.0.2:255.255.255.0::eth0:off:8.8.8.8 console=ttyAMA0 net.ifnames=0'",
         ]
 
         # add additional qemu args if they were provided
