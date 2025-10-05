@@ -225,16 +225,18 @@ class Blob_vm(vrnetlab.VM):
             "-kernel",
             self.kernel,
             "-append",
-            f"'root=/dev/vda rw mem={self.ram}M ip=192.168.7.2::192.168.7.1:255.255.255.0::eth0:off:8.8.8.8 console=ttyAMA0 '",
+            f"'root=/dev/vda rw mem={self.ram}M ip=192.168.7.2::192.168.7.1:255.255.255.0::eth0:off:8.8.8.8 console=ttyAMA0 net.ifnames=0'",
         ]
 
         # add additional qemu args if they were provided
         if self.qemu_additional_args:
             self.qemu_args.extend(self.qemu_additional_args)
 
+        # EDITED: Disable KVM. Does not seem to work for cross architecture emulation.
+        # TODO: Add check if emuated CPU is "KVM-compatible" with host CPU.
         # enable hardware assist if KVM is available
-        if os.path.exists("/dev/kvm"):
-            self.qemu_args.insert(1, "-enable-kvm")
+        # if os.path.exists("/dev/kvm"):
+        #    self.qemu_args.insert(1, "-enable-kvm")
 
     def bootstrap_spin(self):
         """This function should be called periodically to do work."""
