@@ -36,7 +36,7 @@ def trace(self, message, *args, **kws):
 logging.Logger.trace = trace
 
 
-class Ubuntu_vm(vrnetlab.VM):
+class Blob_vm(vrnetlab.VM):
     def __init__(
         self,
         hostname,
@@ -45,68 +45,196 @@ class Ubuntu_vm(vrnetlab.VM):
         nics,
         conn_mode,
     ):
-        for e in os.listdir("/"):
-            if re.search(".qcow2$", e):
-                disk_image = "/" + e
+        for e in os.listdir("/images"):
+            if re.search(".rootfs.ext4$", e):
+                disk_image = "/images/" + e
 
-        super(Ubuntu_vm, self).__init__(
-            username, password, disk_image=disk_image, ram=512
-        )
+        for e in os.listdir("/images"):
+            if re.search("^Image$", e):
+                kernel = "/images/" + e
+
+        self.init2(username, password, disk_image=disk_image, kernel=kernel)
 
         self.num_nics = nics
         self.hostname = hostname
         self.conn_mode = conn_mode
         self.nic_type = "virtio-net-pci"
 
-        self.image_name = "cloud_init.iso"
-        self.create_boot_image()
+    def init2(
+        self,
+        username,
+        password,
+        disk_image="",
+        kernel="",  # EDITED (ADDED)
+        num=0,
+        ram=256,  # EDITED
+        driveif="ide",
+        provision_pci_bus=True,
+        cpu="cortex-a57",  # EDITED
+        smp="4",  # EDITED
+        mgmt_passthrough=False,
+        mgmt_intf="eth0",
+        mgmt_dhcp=False,
+        min_dp_nics=0,
+        use_scrapli=False,
+        data_intf_prefix="eth",
+    ):
+        self.use_scrapli = use_scrapli
 
-        self.qemu_args.extend(["-cdrom", "/" + self.image_name])
+        # configure logging
+        self.logger = logging.getLogger()
 
-        if "ADD_DISK" in os.environ:
-            disk_size = os.getenv("ADD_DISK")
+        """
+        Configure Scrapli logger to only be INFO level.
+        Scrapli uses 'scrapli' logger by default, and
+        will write all channel i/o as DEBUG log level.
+        """
+        self.scrapli_logger = logging.getLogger("scrapli")
 
-            self.add_disk(disk_size)
+        scrapli_log_level = (
+            logging.DEBUG
+            if os.getenv("DEBUG_SCRAPLI", "false").lower() == "true"
+            else logging.INFO
+        )
+        self.scrapli_logger.setLevel(scrapli_log_level)
 
-    def create_boot_image(self):
-        """Creates a cloud-init iso image with a bootstrap configuration"""
+        # username / password to configure
+        self.username = username
+        self.password = password
 
-        with open("/bootstrap_config.yaml", "w") as cfg_file:
-            cfg_file.write("#cloud-config\n")
-            cfg_file.write(f"hostname: {self.hostname}\n")
-            cfg_file.write(f"fqdn: {self.hostname}\n")
-            cfg_file.write("users:\n")
-            cfg_file.write(f"  - name: {self.username}\n")
-            cfg_file.write("    shell: /bin/bash\n")
-            cfg_file.write('    sudo: "ALL=(ALL) NOPASSWD: ALL"\n')
-            cfg_file.write("    groups: users, admin\n")
-            cfg_file.write(f"    plain_text_passwd: {self.password}\n")
-            cfg_file.write("    lock_passwd: false\n")
-            cfg_file.write("ssh_pwauth: true\n")
-            cfg_file.write("disable_root: false\n")
-            cfg_file.write("timezone: Europe/Berlin\n")
-            # Disable cloud-init for the subsequent boots
-            cfg_file.write("runcmd:\n")
-            cfg_file.write("  - touch /etc/cloud/cloud-init.disabled\n")
+        self.num = num
+        self.image = disk_image
+        self.kernel = kernel
 
-        with open("/network_config.yaml", "w") as net_cfg_file:
-            net_cfg_file.write("version: 2\n")
-            net_cfg_file.write("ethernets:\n")
-            net_cfg_file.write("  enp1s0:\n")
-            net_cfg_file.write("    addresses: [10.0.0.15/24]\n")
-            net_cfg_file.write("    gateway4: 10.0.0.2\n")
-            net_cfg_file.write("    nameservers:\n")
-            net_cfg_file.write("        addresses: [ 9.9.9.9 ]\n")
+        self.running = False
+        self.spins = 0
+        self.p = None
+        self.tn = None
 
-        cloud_localds_args = [
-            "cloud-localds",
-            "-v",
-            "--network-config=/network_config.yaml",
-            "/" + self.image_name,
-            "/bootstrap_config.yaml",
+        self._ram = ram
+        self._cpu = cpu
+        self._smp = smp
+        self.mgmt_intf = os.environ.get("CLAB_MGMT_INTF", mgmt_intf)
+
+        # various settings
+        self.uuid = None
+        self.fake_start_date = None
+        self.nic_type = "e1000"
+        self.num_nics = 0
+        # number of nics that are actually *provisioned* (as in nics that will be added to container)
+        self.num_provisioned_nics = int(os.environ.get("CLAB_INTFS", 0))
+        # "highest" provisioned nic num -- used for making sure we can allocate nics without needing
+        # to have them allocated sequential from eth1
+        self.highest_provisioned_nic_num = 0
+
+        # Whether the management interface is pass-through or host-forwarded.
+        # Host-forwarded is the original vrnetlab mode where a VM gets a static IP for its management address,
+        # which **does not** match the eth0 interface of a container.
+        # In pass-through mode the VM container uses the same IP as the container's eth0 interface and transparently forwards traffic between the two interfaces.
+        # See https://github.com/hellt/vrnetlab/issues/286
+        self.mgmt_passthrough = (
+            os.environ.get("CLAB_MGMT_PASSTHROUGH", "").lower() == "true"
+            if os.environ.get("CLAB_MGMT_PASSTHROUGH")
+            else mgmt_passthrough
+        )
+
+        # Check if CLAB_MGMT_DHCP environment variable is set
+        self.mgmt_dhcp = (
+            os.environ.get("CLAB_MGMT_DHCP", "").lower() == "true"
+            if os.environ.get("CLAB_MGMT_DHCP")
+            else mgmt_dhcp
+        )
+
+        # Check if CLAB_INTF_PREFIX environment variable is set
+        self.data_intf_prefix = os.environ.get("CLAB_INTF_PREFIX", data_intf_prefix)
+
+        # Populate management IP and gateway
+        # If CLAB_MGMT_DHCP environment variable is set, we assume that a DHCP client
+        # inside of the VM will take care about setting the management IP and gateway.
+        if self.mgmt_passthrough:
+            if self.mgmt_dhcp:
+                self.mgmt_address_ipv4 = "dhcp"
+                self.mgmt_address_ipv6 = "dhcp"
+                self.mgmt_gw_ipv4 = "dhcp"
+                self.mgmt_gw_ipv6 = "dhcp"
+            else:
+                self.mgmt_address_ipv4, self.mgmt_address_ipv6 = self.get_mgmt_address()
+                self.mgmt_gw_ipv4, self.mgmt_gw_ipv6 = self.get_mgmt_gw()
+        else:
+            self.mgmt_address_ipv4 = "10.0.0.15/24"
+            self.mgmt_address_ipv6 = "2001:db8::2/64"
+            self.mgmt_gw_ipv4 = "10.0.0.2"
+            self.mgmt_gw_ipv6 = "2001:db8::1"
+
+        self.insuffucient_nics = False
+        self.min_nics = 0
+        # if an image needs minimum amount of dataplane nics to bootup, specify
+        if min_dp_nics:
+            self.min_nics = min_dp_nics
+
+        # management subnet properties, defaults
+        self.mgmt_subnet = "10.0.0.0/24"
+        self.mgmt_host_ip = 2
+        self.mgmt_guest_ip = 15
+
+        #  Default TCP ports forwarded (TODO tune per platform):
+        #  80    - http
+        #  443   - https
+        #  830   - netconf
+        #  6030  - gnmi/gnoi arista
+        #  8080  - sonic gnmi/gnoi, other http apis
+        #  9339  - iana gnmi/gnoi
+        #  32767 - gnmi/gnoi juniper
+        #  50051 - cisco nx-os gnmi/gnoi
+        #  57400 - nokia gnmi/gnoi
+        self.mgmt_tcp_ports = [80, 443, 830, 6030, 8080, 9339, 32767, 50051, 57400]
+
+        # we setup pci bus by default
+        self.provision_pci_bus = provision_pci_bus
+        self.nics_per_pci_bus = 26  # tested to work with XRv
+        self.smbios = []
+
+        self.start_nic_eth_idx = 1
+
+        # wait_pattern is the pattern we wait on the serial connection when pushing config commands
+        self.wait_pattern = "#"
+
+        self.qemu_args = [
+            "qemu-system-aarch64",
+            "-machine",
+            "virt",
+            "-m",  # memory
+            str(self.ram),
+            "-cpu",  # cpu type
+            self.cpu,
+            "-smp",
+            self.smp,  # cpu core configuration
+            "-monitor",
+            f"tcp:0.0.0.0:40{self.num:02d},server,nowait",
+            "-serial",
+            f"telnet:0.0.0.0:50{self.num:02d},server,nowait",
+            "-nographic",
+            "-object",
+            "rng-random,filename=/dev/urandom,id=rng0",
+            "-device",
+            "virtio-rng-pci,rng=rng0",
+            "-drive",
+            f"id=disk0,file={self.image},if=none,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=disk0",
+            "-kernel",
+            self.kernel,
+            "-append",
+            f"'root=/dev/vda rw mem={self.ram}M ip=192.168.7.2::192.168.7.1:255.255.255.0::eth0:off:8.8.8.8 console=ttyAMA0 '",
         ]
 
-        subprocess.Popen(cloud_localds_args)
+        # add additional qemu args if they were provided
+        if self.qemu_additional_args:
+            self.qemu_args.extend(self.qemu_additional_args)
+
+        # enable hardware assist if KVM is available
+        if os.path.exists("/dev/kvm"):
+            self.qemu_args.insert(1, "-enable-kvm")
 
     def bootstrap_spin(self):
         """This function should be called periodically to do work."""
@@ -148,35 +276,19 @@ class Ubuntu_vm(vrnetlab.VM):
         Augment the parent class function to change the PCI bus
         """
         # call parent function to generate the mgmt interface
-        res = super(Ubuntu_vm, self).gen_mgmt()
+        res = super(Blob_vm, self).gen_mgmt()
 
-        # we need to place mgmt interface on the same bus with other interfaces in Ubuntu,
+        # we need to place mgmt interface on the same bus with other interfaces in Blob,
         # to get nice (predictable) interface names
         if "bus=pci.1" not in res[-3]:
-            res[-3] = res[-3] + ",bus=pci.1"
+            res[-3] = res[-3] + ",bus=pci.1" + ",addr=1"
         return res
 
-    def add_disk(self, disk_size, driveif="ide"):
-        additional_disk = f"disk_{disk_size}.qcow2"
 
-        if not os.path.exists(additional_disk):
-            self.logger.debug(f"Creating additional disk image {additional_disk}")
-            vrnetlab.run_command(
-                ["qemu-img", "create", "-f", "qcow2", additional_disk, disk_size]
-            )
-
-        self.qemu_args.extend(
-            [
-                "-drive",
-                f"if={driveif},file={additional_disk}",
-            ]
-        )
-
-
-class Ubuntu(vrnetlab.VR):
+class Blob(vrnetlab.VR):
     def __init__(self, hostname, username, password, nics, conn_mode):
-        super(Ubuntu, self).__init__(username, password)
-        self.vms = [Ubuntu_vm(hostname, username, password, nics, conn_mode)]
+        super(Blob, self).__init__(username, password)
+        self.vms = [Blob_vm(hostname, username, password, nics, conn_mode)]
 
 
 if __name__ == "__main__":
@@ -205,7 +317,7 @@ if __name__ == "__main__":
     if args.trace:
         logger.setLevel(1)
 
-    vr = Ubuntu(
+    vr = Blob(
         args.hostname,
         args.username,
         args.password,
